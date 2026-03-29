@@ -88,12 +88,13 @@ John Deere,310SL Backhoe Loader,2019
 ## How It Works
 
 1. Parses the input CSV or Markdown file for equipment entries (preserving any existing spec data)
-2. For each entry, runs multiple search queries via DuckDuckGo for broader spec coverage
-3. Fetches up to 4 top results per entry with automatic retry on network errors
-4. Parses specifications using either:
+2. For each entry, searches Google and extracts the **AI Overview (Gemini summary)** which often contains all the specs in one shot
+3. If the AI Overview has rich spec data (4+ spec keywords), uses it directly — no need to visit individual pages
+4. Falls back to fetching individual result pages (and DuckDuckGo) when the overview is absent or thin
+5. Parses specifications using either:
    - **OpenRouter API** (recommended) — sends the raw text to an LLM for structured extraction
    - **Regex fallback** — pattern-matches common spec formats when no API key is provided
-5. Writes the enriched data back to the output file with a coverage summary report
+6. Writes the enriched data back to the output file with a coverage summary report
 
 ## Options
 

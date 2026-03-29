@@ -46,8 +46,10 @@ SEARCH_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -189,8 +191,110 @@ def _retry_request(request_func, description, retries=MAX_RETRIES):
     return None
 
 
+def google_search_with_overview(query):
+    """Search Google and extract the AI Overview text plus snippet/result text.
+
+    Returns (overview_text, results) where overview_text is the extracted
+    AI Overview content (may be empty) and results is a list of
+    (title, url, snippet) tuples from the regular results.
+    """
+    overview_text = ""
+    results = []
+
+    try:
+        def do_search():
+            resp = requests.get(
+                "https://www.google.com/search",
+                params={"q": query, "hl": "en", "num": "10"},
+                headers=SEARCH_HEADERS,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            return resp
+
+        resp = _retry_request(do_search, f"Google search '{query[:50]}...'")
+        if resp is None:
+            return overview_text, results
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # --- Extract AI Overview ---
+        # Google wraps AI Overviews in containers that can be identified by
+        # several signals. We try multiple selectors since Google changes
+        # class names frequently.
+        overview_candidates = []
+
+        # Method 1: div with data-attrid containing "ai_overview" or
+        # "AnswerV2" style blocks
+        for div in soup.find_all("div", attrs={"data-attrid": True}):
+            attrid = div.get("data-attrid", "")
+            if "overview" in attrid.lower() or "ai" in attrid.lower():
+                overview_candidates.append(div.get_text(separator=" ", strip=True))
+
+        # Method 2: Look for common AI Overview container patterns
+        # Google often uses divs with specific class patterns for the
+        # overview block that sits above organic results
+        for selector in [
+            "div[data-md]",                # AI overview data blocks
+            "div.kp-blk",                  # knowledge panel blocks
+            "div.IZ6rdc",                  # AI overview wrapper (common)
+            "div[data-async-type='editableDirectAnswer']",
+            "div.wDYxhc",                  # featured snippet / AI overview
+            "block-component",             # newer AI overview container
+        ]:
+            for el in soup.select(selector):
+                text = el.get_text(separator=" ", strip=True)
+                if len(text) > 80:  # skip trivially small fragments
+                    overview_candidates.append(text)
+
+        # Method 3: Broader heuristic — look for large text blocks near the
+        # top of the page that contain spec-like keywords
+        spec_keywords = {"weight", "dimensions", "engine", "horsepower",
+                         "capacity", "height", "width", "length", "fuel",
+                         "lbs", "pounds", "hp", "diesel", "axle"}
+        for div in soup.find_all("div"):
+            text = div.get_text(separator=" ", strip=True)
+            if len(text) > 200 and len(text) < 5000:
+                text_lower = text.lower()
+                keyword_hits = sum(1 for kw in spec_keywords if kw in text_lower)
+                if keyword_hits >= 4:
+                    overview_candidates.append(text)
+
+        # Deduplicate and pick the best (longest with most spec keywords)
+        if overview_candidates:
+            # Score each candidate by keyword density
+            def score(txt):
+                t = txt.lower()
+                return sum(1 for kw in spec_keywords if kw in t) * 100 + len(txt)
+
+            overview_candidates.sort(key=score, reverse=True)
+            overview_text = overview_candidates[0]
+
+        # --- Extract regular search results ---
+        for g in soup.select("div.g, div.tF2Cxc"):
+            link_tag = g.select_one("a[href]")
+            title_tag = g.select_one("h3")
+            snippet_tag = g.select_one("div.VwiC3b, span.aCOpRe, div.s")
+            if link_tag and title_tag:
+                href = link_tag.get("href", "")
+                if href.startswith("/url?"):
+                    # Extract actual URL from Google redirect
+                    from urllib.parse import urlparse, parse_qs
+                    parsed = parse_qs(urlparse(href).query)
+                    href = parsed.get("q", [href])[0]
+                if href.startswith("http"):
+                    title = title_tag.get_text(strip=True)
+                    snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+                    results.append((title, href, snippet))
+
+    except Exception as e:
+        print(f"  [!] Google search error: {e}", file=sys.stderr)
+
+    return overview_text, results
+
+
 def web_search(query, num_results=5):
-    """Search using DuckDuckGo HTML and return a list of (title, url, snippet) tuples."""
+    """Fallback search using DuckDuckGo HTML. Returns (title, url, snippet) tuples."""
     results = []
     try:
         def do_search():
@@ -204,7 +308,7 @@ def web_search(query, num_results=5):
             resp.raise_for_status()
             return resp
 
-        resp = _retry_request(do_search, f"Search for '{query[:50]}...'")
+        resp = _retry_request(do_search, f"DuckDuckGo search '{query[:50]}...'")
         if resp is None:
             return results
 
@@ -219,7 +323,7 @@ def web_search(query, num_results=5):
                 snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
                 results.append((title, href, snippet))
     except Exception as e:
-        print(f"  [!] Search error: {e}", file=sys.stderr)
+        print(f"  [!] DuckDuckGo search error: {e}", file=sys.stderr)
 
     return results
 
@@ -409,17 +513,35 @@ def parse_specs_with_regex(text):
 # ---------------------------------------------------------------------------
 
 def _build_search_queries(make, model_name, year):
-    """Build multiple search queries for better spec coverage."""
+    """Build search queries for spec lookup."""
     desc = f"{year} {make} {model_name}"
     queries = [
-        f"{desc} specifications weight dimensions",
-        f"{make} {model_name} {year} specs horsepower fuel capacity",
+        f"{desc} specifications weight dimensions horsepower",
+        f"{make} {model_name} {year} specs fuel capacity engine axles",
     ]
     return queries
 
 
+def _count_spec_keywords(text):
+    """Count how many spec-related keywords appear in text."""
+    keywords = {"weight", "dimension", "engine", "horsepower", "hp",
+                "capacity", "height", "width", "length", "fuel",
+                "lbs", "pounds", "diesel", "axle", "speed", "mph"}
+    text_lower = text.lower()
+    return sum(1 for kw in keywords if kw in text_lower)
+
+
 def lookup_equipment_specs(entry, api_key=None, model=None):
-    """Search for specs for a single equipment entry and return enriched entry."""
+    """Search for specs for a single equipment entry and return enriched entry.
+
+    Strategy:
+    1. Google search — extract AI Overview text (Gemini summary) if available.
+       This often contains all the specs we need in a single page load.
+    2. If the AI Overview has rich spec content, use it directly — no need to
+       visit individual result pages.
+    3. Fall back to fetching individual pages (and DuckDuckGo) only when the
+       Google overview is absent or thin.
+    """
     make = entry["make"]
     model_name = entry["model"]
     year = entry["year"]
@@ -429,38 +551,61 @@ def lookup_equipment_specs(entry, api_key=None, model=None):
     print(f"  Looking up: {desc}")
     print(f"{'='*60}")
 
-    # Try multiple search queries for broader coverage
     queries = _build_search_queries(make, model_name, year)
+    combined_text = ""
     all_results = []
     seen_urls = set()
 
+    # --- Phase 1: Google search, looking for AI Overview ---
     for query in queries:
-        results = web_search(query, num_results=5)
-        for r in results:
+        overview_text, g_results = google_search_with_overview(query)
+
+        if overview_text:
+            kw_count = _count_spec_keywords(overview_text)
+            print(f"  [Google AI Overview] Found ({kw_count} spec keywords, "
+                  f"{len(overview_text)} chars)")
+            combined_text += f"\n--- Google AI Overview for: {query} ---\n{overview_text}\n"
+
+        for r in g_results:
             if r[1] not in seen_urls:
                 seen_urls.add(r[1])
                 all_results.append(r)
+
         time.sleep(1)
 
-    if not all_results:
-        print("  [!] No search results found.")
-        return {**entry, **{f: "" for f in SPEC_FIELDS}}
+    # Check if the overview text alone is rich enough (4+ spec keywords)
+    overview_sufficient = _count_spec_keywords(combined_text) >= 4
 
-    # Fetch text from top unique results (up to 4 pages)
-    combined_text = ""
-    fetched = 0
-    for i, (title, url, snippet) in enumerate(all_results):
-        if fetched >= 4:
-            break
-        print(f"  [{fetched+1}] {title}")
-        page_text = fetch_page_text(url, max_chars=6000)
-        if page_text:
-            combined_text += f"\n--- Source: {title} ---\n{page_text}\n"
-            fetched += 1
-        time.sleep(1)  # polite delay
+    if overview_sufficient:
+        print("  AI Overview contains rich spec data — skipping individual page fetches.")
+    else:
+        # --- Phase 2: Fall back to fetching individual result pages ---
+        if not all_results:
+            # Google gave no results; try DuckDuckGo
+            print("  No Google results, trying DuckDuckGo...")
+            for query in queries:
+                ddg_results = web_search(query, num_results=5)
+                for r in ddg_results:
+                    if r[1] not in seen_urls:
+                        seen_urls.add(r[1])
+                        all_results.append(r)
+                time.sleep(1)
+
+        if all_results:
+            print("  Fetching individual result pages for more data...")
+            fetched = 0
+            for title, url, snippet in all_results:
+                if fetched >= 3:
+                    break
+                print(f"  [{fetched+1}] {title}")
+                page_text = fetch_page_text(url, max_chars=6000)
+                if page_text:
+                    combined_text += f"\n--- Source: {title} ---\n{page_text}\n"
+                    fetched += 1
+                time.sleep(1)
 
     if not combined_text:
-        print("  [!] Could not fetch any page content.")
+        print("  [!] No content found from any source.")
         return {**entry, **{f: "" for f in SPEC_FIELDS}}
 
     # Parse specs
