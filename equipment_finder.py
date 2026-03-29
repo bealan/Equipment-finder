@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Equipment Specification Finder
+Equipment Info Finder
 
 Reads a CSV or Markdown file containing construction equipment/vehicles
 (make, model, year), searches the internet for specifications, and appends
@@ -407,7 +407,7 @@ def lookup_equipment_specs(entry, api_key=None, model=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Equipment Specification Finder — looks up specs for construction equipment.",
+        description="Equipment Info Finder — looks up specs for construction equipment.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

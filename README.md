@@ -1,4 +1,4 @@
-# Equipment Specification Finder
+# Equipment Info Finder
 
 Reads a CSV or Markdown file of construction equipment/vehicles listed by **make, model, and year**, searches the internet for their specifications, and appends the results back to the file.
 
