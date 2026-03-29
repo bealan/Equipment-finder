@@ -22,6 +22,10 @@ import time
 import requests
 from bs4 import BeautifulSoup
 
+# Maximum retries for network requests
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2  # seconds, doubles each retry
+
 # Specification fields we attempt to populate
 SPEC_FIELDS = [
     "weight_lbs",
@@ -54,27 +58,34 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 # ---------------------------------------------------------------------------
 
 def read_csv(filepath):
-    """Read equipment entries from a CSV file."""
+    """Read equipment entries from a CSV file, preserving any existing spec data."""
     entries = []
     with open(filepath, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            entries.append({
+            entry = {
                 "make": row.get("make", "").strip(),
                 "model": row.get("model", "").strip(),
                 "year": row.get("year", "").strip(),
-            })
+            }
+            # Preserve any existing spec values
+            for field in SPEC_FIELDS:
+                val = row.get(field, "").strip()
+                if val:
+                    entry[field] = val
+            entries.append(entry)
     return entries
 
 
 def read_markdown(filepath):
-    """Read equipment entries from a Markdown table file."""
+    """Read equipment entries from a Markdown table file, preserving existing spec data."""
     entries = []
     with open(filepath, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
     in_table = False
     header_indices = {}
+    header_names = []
     for line in lines:
         stripped = line.strip()
         if not stripped.startswith("|"):
@@ -85,6 +96,7 @@ def read_markdown(filepath):
 
         if not in_table:
             # First row with pipes is the header
+            header_names = cells
             for i, cell in enumerate(cells):
                 lower = cell.lower()
                 if "make" in lower:
@@ -93,6 +105,12 @@ def read_markdown(filepath):
                     header_indices["model"] = i
                 elif "year" in lower:
                     header_indices["year"] = i
+                else:
+                    # Map spec field headers back to field names
+                    for field in SPEC_FIELDS:
+                        if field.replace("_", " ") == lower:
+                            header_indices[field] = i
+                            break
             in_table = True
             continue
 
@@ -101,13 +119,25 @@ def read_markdown(filepath):
             continue
 
         if header_indices:
-            entries.append({
+            entry = {
                 "make": cells[header_indices.get("make", 0)].strip(),
                 "model": cells[header_indices.get("model", 1)].strip(),
                 "year": cells[header_indices.get("year", 2)].strip(),
-            })
+            }
+            # Preserve any existing spec values
+            for field in SPEC_FIELDS:
+                if field in header_indices and header_indices[field] < len(cells):
+                    val = cells[header_indices[field]].strip()
+                    if val:
+                        entry[field] = val
+            entries.append(entry)
 
     return entries
+
+
+def has_specs(entry):
+    """Check if an entry already has at least one spec field populated."""
+    return any(entry.get(f) for f in SPEC_FIELDS)
 
 
 def write_csv(filepath, entries):
@@ -142,18 +172,42 @@ def write_markdown(filepath, entries):
 # Web search
 # ---------------------------------------------------------------------------
 
+def _retry_request(request_func, description, retries=MAX_RETRIES):
+    """Execute a request function with retry logic and exponential backoff."""
+    for attempt in range(retries):
+        try:
+            return request_func()
+        except requests.exceptions.RequestException as e:
+            if attempt < retries - 1:
+                wait = RETRY_BACKOFF * (2 ** attempt)
+                print(f"  [!] {description} failed (attempt {attempt+1}/{retries}): {e}", file=sys.stderr)
+                print(f"      Retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                print(f"  [!] {description} failed after {retries} attempts: {e}", file=sys.stderr)
+                raise
+    return None
+
+
 def web_search(query, num_results=5):
     """Search using DuckDuckGo HTML and return a list of (title, url, snippet) tuples."""
     results = []
     try:
-        url = "https://html.duckduckgo.com/html/"
-        resp = requests.post(
-            url,
-            data={"q": query},
-            headers=SEARCH_HEADERS,
-            timeout=15,
-        )
-        resp.raise_for_status()
+        def do_search():
+            url = "https://html.duckduckgo.com/html/"
+            resp = requests.post(
+                url,
+                data={"q": query},
+                headers=SEARCH_HEADERS,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return resp
+
+        resp = _retry_request(do_search, f"Search for '{query[:50]}...'")
+        if resp is None:
+            return results
+
         soup = BeautifulSoup(resp.text, "html.parser")
 
         for result_div in soup.select(".result")[:num_results]:
@@ -173,8 +227,15 @@ def web_search(query, num_results=5):
 def fetch_page_text(url, max_chars=12000):
     """Fetch a web page and return its visible text, truncated."""
     try:
-        resp = requests.get(url, headers=SEARCH_HEADERS, timeout=15)
-        resp.raise_for_status()
+        def do_fetch():
+            resp = requests.get(url, headers=SEARCH_HEADERS, timeout=15)
+            resp.raise_for_status()
+            return resp
+
+        resp = _retry_request(do_fetch, f"Fetch {url[:60]}")
+        if resp is None:
+            return ""
+
         soup = BeautifulSoup(resp.text, "html.parser")
 
         # Remove script and style elements
@@ -347,6 +408,16 @@ def parse_specs_with_regex(text):
 # Main lookup logic
 # ---------------------------------------------------------------------------
 
+def _build_search_queries(make, model_name, year):
+    """Build multiple search queries for better spec coverage."""
+    desc = f"{year} {make} {model_name}"
+    queries = [
+        f"{desc} specifications weight dimensions",
+        f"{make} {model_name} {year} specs horsepower fuel capacity",
+    ]
+    return queries
+
+
 def lookup_equipment_specs(entry, api_key=None, model=None):
     """Search for specs for a single equipment entry and return enriched entry."""
     make = entry["make"]
@@ -358,21 +429,34 @@ def lookup_equipment_specs(entry, api_key=None, model=None):
     print(f"  Looking up: {desc}")
     print(f"{'='*60}")
 
-    # Search for specification pages
-    query = f"{desc} specifications weight dimensions"
-    results = web_search(query, num_results=5)
+    # Try multiple search queries for broader coverage
+    queries = _build_search_queries(make, model_name, year)
+    all_results = []
+    seen_urls = set()
 
-    if not results:
+    for query in queries:
+        results = web_search(query, num_results=5)
+        for r in results:
+            if r[1] not in seen_urls:
+                seen_urls.add(r[1])
+                all_results.append(r)
+        time.sleep(1)
+
+    if not all_results:
         print("  [!] No search results found.")
         return {**entry, **{f: "" for f in SPEC_FIELDS}}
 
-    # Fetch text from top results
+    # Fetch text from top unique results (up to 4 pages)
     combined_text = ""
-    for i, (title, url, snippet) in enumerate(results[:3]):
-        print(f"  [{i+1}] {title}")
+    fetched = 0
+    for i, (title, url, snippet) in enumerate(all_results):
+        if fetched >= 4:
+            break
+        print(f"  [{fetched+1}] {title}")
         page_text = fetch_page_text(url, max_chars=6000)
         if page_text:
             combined_text += f"\n--- Source: {title} ---\n{page_text}\n"
+            fetched += 1
         time.sleep(1)  # polite delay
 
     if not combined_text:
@@ -405,6 +489,29 @@ def lookup_equipment_specs(entry, api_key=None, model=None):
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+def print_summary(entries):
+    """Print a summary table of spec coverage for all entries."""
+    print(f"\n{'='*60}")
+    print("  SPECIFICATION COVERAGE SUMMARY")
+    print(f"{'='*60}")
+    print(f"  {'Equipment':<40} {'Specs Found':>12}")
+    print(f"  {'-'*40} {'-'*12}")
+
+    total_found = 0
+    total_possible = 0
+    for entry in entries:
+        desc = f"{entry.get('year', '')} {entry.get('make', '')} {entry.get('model', '')}"
+        found = sum(1 for f in SPEC_FIELDS if entry.get(f))
+        total_found += found
+        total_possible += len(SPEC_FIELDS)
+        print(f"  {desc:<40} {found:>4}/{len(SPEC_FIELDS)}")
+
+    pct = (total_found / total_possible * 100) if total_possible else 0
+    print(f"  {'-'*40} {'-'*12}")
+    print(f"  {'TOTAL':<40} {total_found:>4}/{total_possible} ({pct:.0f}%)")
+    print(f"{'='*60}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Equipment Info Finder — looks up specs for construction equipment.",
@@ -414,6 +521,7 @@ Examples:
   python equipment_finder.py sample_equipment.csv
   python equipment_finder.py sample_equipment.md -o results.csv
   python equipment_finder.py equipment.csv --api-key sk-or-... --model google/gemini-2.0-flash-001
+  python equipment_finder.py results.csv --skip-existing   # only look up entries missing specs
 
 Environment variables:
   OPENROUTER_API_KEY   API key for OpenRouter (alternative to --api-key)
@@ -445,6 +553,11 @@ Environment variables:
         default=2.0,
         help="Delay in seconds between equipment lookups (default: 2.0)",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip entries that already have spec data (useful for resuming partial runs)",
+    )
 
     args = parser.parse_args()
 
@@ -475,7 +588,15 @@ Environment variables:
 
     # Process each entry
     enriched_entries = []
+    skipped = 0
     for i, entry in enumerate(entries):
+        if args.skip_existing and has_specs(entry):
+            desc = f"{entry.get('year', '')} {entry.get('make', '')} {entry.get('model', '')}"
+            print(f"\n  Skipping (already has specs): {desc}")
+            enriched_entries.append(entry)
+            skipped += 1
+            continue
+
         enriched = lookup_equipment_specs(entry, args.api_key, args.model)
         enriched_entries.append(enriched)
         if i < len(entries) - 1:
@@ -490,9 +611,12 @@ Environment variables:
     else:
         write_csv(output_file, enriched_entries)
 
-    print(f"\n{'='*60}")
+    # Print summary
+    print_summary(enriched_entries)
     print(f"  Results written to: {output_file}")
-    print(f"  Total entries processed: {len(enriched_entries)}")
+    print(f"  Entries processed: {len(enriched_entries) - skipped}")
+    if skipped:
+        print(f"  Entries skipped (--skip-existing): {skipped}")
     print(f"{'='*60}")
 
 

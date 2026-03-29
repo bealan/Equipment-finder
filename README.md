@@ -54,6 +54,12 @@ python equipment_finder.py sample_equipment.md -o results.md
 python equipment_finder.py sample_equipment.csv -o results.csv
 ```
 
+### Resume a partial run (skip entries that already have specs)
+
+```bash
+python equipment_finder.py results.csv --skip-existing
+```
+
 ### Choose an OpenRouter model
 
 ```bash
@@ -81,13 +87,13 @@ John Deere,310SL Backhoe Loader,2019
 
 ## How It Works
 
-1. Parses the input CSV or Markdown file for equipment entries
-2. For each entry, searches DuckDuckGo for specification pages
-3. Fetches the top results and extracts page text
+1. Parses the input CSV or Markdown file for equipment entries (preserving any existing spec data)
+2. For each entry, runs multiple search queries via DuckDuckGo for broader spec coverage
+3. Fetches up to 4 top results per entry with automatic retry on network errors
 4. Parses specifications using either:
    - **OpenRouter API** (recommended) — sends the raw text to an LLM for structured extraction
    - **Regex fallback** — pattern-matches common spec formats when no API key is provided
-5. Writes the enriched data back to the output file
+5. Writes the enriched data back to the output file with a coverage summary report
 
 ## Options
 
@@ -97,3 +103,4 @@ John Deere,310SL Backhoe Loader,2019
 | `--api-key` | `$OPENROUTER_API_KEY` | OpenRouter API key |
 | `--model` | `google/gemini-2.0-flash-001` | OpenRouter model for parsing |
 | `--delay` | `2.0` | Seconds between lookups |
+| `--skip-existing` | off | Skip entries that already have spec data |
