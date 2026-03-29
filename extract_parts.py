@@ -39,20 +39,48 @@ def read_input_csv(filepath):
     return headers, rows
 
 
-def extract_parts_with_llm(text_blob, api_key, model):
+def extract_parts_with_llm(text_blob, api_key, model, sample_parts="", sample_noise=""):
     """Use OpenRouter LLM to extract part numbers from a messy text blob."""
-    prompt = f"""You are an expert at identifying part numbers in unstructured text.
+    # Build dynamic sections from user-provided samples
+    parts_examples = ""
+    if sample_parts:
+        parts_examples = f"""
+The user has confirmed these are examples of REAL part numbers from their data:
+  {sample_parts}
+Use these as a guide for the format and style of part numbers to look for."""
 
-Extract ALL individual part numbers from the text below. Part numbers can be in
-mixed formats: alphanumeric (e.g., ABC-12345), pure digits, codes with dashes or
-dots, manufacturer part numbers, etc.
+    noise_examples = ""
+    if sample_noise:
+        noise_examples = f"""
+The user has confirmed these are examples of things that are NOT part numbers (ignore these and anything similar):
+  {sample_noise}"""
 
+    prompt = f"""You are an expert at identifying part numbers in unstructured text from construction and heavy equipment contexts.
+
+Extract ALL individual part numbers from the text below. Part numbers come in many formats:
+- Letter-dash-digits: KMP-8347, AT-39571, 1R-0750
+- Letter-prefix no dash: T165404, RE505980, AH212096
+- Multi-segment dashed: 6754-81-8180, 20Y-32-00300, 707-01-0K620
+- Digit-dash-digits: 259-0815, 4333040
+- Dotted formats: 3E.1234, 5P.7890
+- Slash-separated: 123/4567
+- Any other manufacturer part number or catalog number
+{parts_examples}
 Rules:
 - Return ONLY a JSON array of strings, each string being one part number.
-- Do NOT include equipment codes that match the pattern "XX - ###" (two letters, space, dash, space, digits) — those are equipment codes, not part numbers.
-- Do NOT include general descriptions, model names, or random text — only actual part numbers.
+- Do NOT include any of the following — these are NOT part numbers:
+  * Equipment codes matching "XX - ###" (two letters, space-dash-space, digits) e.g. "CA - 401"
+  * Years (e.g. 2018, 2019, 2020, 2021)
+  * Equipment make names (Caterpillar, John Deere, Komatsu, Volvo, Case, CAT, etc.)
+  * Equipment model names/numbers (D6T, 310SL, PC210LC-11, A40G, CX350D, etc.)
+  * Measurements or units (lbs, psi, gal, ft, mm, hours, hrs, mph)
+  * Dates in any format (01/15/2023, 2023-01-15, etc.)
+  * Quantities (qty 5, x3, etc.)
+  * Serial numbers, work order numbers, drawing references, image file names, PO numbers
+  * Generic English words, descriptions, or maintenance notes
+{noise_examples}
+- Preserve the exact formatting of each part number as it appears in the text.
 - If no part numbers are found, return an empty array: []
-- Strip any surrounding whitespace from each part number.
 
 Text:
 ---
@@ -100,28 +128,154 @@ Return ONLY a JSON array, no markdown fences, no explanation."""
         return []
 
 
-def extract_parts_with_regex(text_blob):
+def extract_parts_with_regex(text_blob, sample_noise=""):
     """Fallback: use regex heuristics to find part numbers in text."""
-    # Common part number patterns (adjust as needed)
+    # Build a set of noise examples to exclude
+    noise_set = set()
+    if sample_noise:
+        for item in sample_noise.split(","):
+            item = item.strip()
+            if item:
+                noise_set.add(item.upper())
+
+    # Common part number patterns for construction/heavy equipment
     patterns = [
-        r'\b[A-Z]{2,5}-\d{3,10}\b',           # ABC-12345
-        r'\b\d{2,4}-[A-Z]?\d{3,8}\b',         # 12-34567, 12-A3456
-        r'\b[A-Z]\d{4,10}\b',                  # A12345
-        r'\b\d{5,12}\b',                        # 1234567 (5-12 digit numbers)
-        r'\b[A-Z]{1,3}\d{2,4}[A-Z]\d{2,4}\b', # AB12C34
+        # Multi-segment dashed: 6754-81-8180, 20Y-32-00300, 707-01-0K620
+        r'\b\d{1,4}[A-Z]?-\d{2,4}-(?:[A-Z0-9]{3,8})\b',
+        # Letter-prefix with dash: KMP-8347, AT-39571, 1R-0750
+        r'\b[A-Z]{1,5}-\d{3,10}\b',
+        # Digit-letter-dash: 1R-0750
+        r'\b\d[A-Z]-\d{3,6}\b',
+        # Digit-dash-digits (3+ digits each side): 259-0815
+        r'\b\d{3,5}-\d{3,8}\b',
+        # Letter-prefix no dash (2+ letters then 4+ digits): RE505980, AH212096, KRA1921
+        r'\b[A-Z]{2,5}\d{4,10}\b',
+        # Single letter prefix (1 letter then 5+ digits): T165404
+        r'\b[A-Z]\d{5,10}\b',
+        # Mixed alphanumeric segments: AB12C34, 20Y32
+        r'\b[A-Z]{1,3}\d{2,4}[A-Z]\d{2,4}\b',
+        # Pure digits 6+ long (catches standalone catalog numbers): 4333040
+        r'\b\d{6,12}\b',
+        # Dotted format: 3E.1234
+        r'\b[A-Z0-9]{1,4}\.[A-Z0-9]{3,8}\b',
+        # Slash-separated (but not dates like 01/15/2024): 123/4567
+        r'\b\d{2,5}/\d{5,8}\b',
     ]
 
-    # Exclude equipment codes like "AB - 123"
-    equipment_code_pattern = re.compile(r'^[A-Za-z]{2}\s*-\s*\d+$')
+    # Exclusion filters
+    # Equipment codes have spaces around dash: "CA - 401", "JD - 102"
+    equipment_code_re = re.compile(r'^[A-Za-z]{2}\s+-\s+\d{1,5}$')
+    year_re = re.compile(r'^(19|20)\d{2}$')
+    # Common equipment model numbers to exclude
+    model_names = {
+        'D6T', '310SL', 'PC210LC', 'A40G', 'CX350D', 'D6', 'D8', 'D9',
+        'D10', 'D11', '320', '330', '345', '349', '390',
+    }
 
     found = set()
     for pattern in patterns:
         for match in re.finditer(pattern, text_blob):
             val = match.group().strip()
-            if not equipment_code_pattern.match(val):
-                found.add(val)
+            # Skip equipment codes
+            if equipment_code_re.match(val):
+                continue
+            # Skip years
+            if year_re.match(val):
+                continue
+            # Skip known model numbers
+            if val.upper() in model_names:
+                continue
+            # Skip user-specified noise examples
+            if val.upper() in noise_set:
+                continue
+            found.add(val)
 
     return sorted(found)
+
+
+def filter_extracted_parts(parts, equip_name="", equip_code="", sample_noise=""):
+    """Post-process extracted parts to remove false positives."""
+    # Equipment codes have spaces around dash: "CA - 401", "JD - 102"
+    equipment_code_re = re.compile(r'^[A-Za-z]{2}\s+-\s+\d{1,5}$')
+    year_re = re.compile(r'^(19|20)\d{2}$')
+    pure_word_re = re.compile(r'^[A-Za-z]+$')
+    # Common noise words that might slip through
+    noise_words = {
+        'bom', 'qty', 'pcs', 'n/a', 'na', 'none', 'see', 'notes', 'also',
+        'the', 'and', 'for', 'with', 'from', 'last', 'next', 'new', 'old',
+        'lbs', 'psi', 'gal', 'hrs', 'mph', 'rpm', 'ft', 'mm', 'in',
+    }
+    # Noise patterns from user-provided samples (detect prefixes like WO-, DWG-, IMG_, PO#)
+    noise_prefixes = set()
+    noise_exact = set()
+    if sample_noise:
+        for item in sample_noise.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            noise_exact.add(item.upper())
+            # Extract prefix pattern (letters/symbols before first digit or underscore)
+            prefix_match = re.match(r'^([A-Za-z]+[-_#])', item)
+            if prefix_match:
+                noise_prefixes.add(prefix_match.group(1).upper())
+    # Extract tokens from equipment name to exclude model numbers
+    name_tokens = set()
+    if equip_name:
+        name_tokens = {t.upper() for t in re.split(r'[\s,]+', equip_name) if t}
+
+    filtered = []
+    seen = set()
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        upper = p.upper()
+        # Dedup
+        if upper in seen:
+            continue
+        seen.add(upper)
+        # Skip equipment codes
+        if equipment_code_re.match(p):
+            continue
+        # Skip if it matches the equipment code from this row
+        if equip_code and p.replace(" ", "") == equip_code.replace(" ", ""):
+            continue
+        # Skip years
+        if year_re.match(p):
+            continue
+        # Skip pure English words
+        if pure_word_re.match(p) and p.lower() in noise_words:
+            continue
+        # Skip if it's a token from the equipment name (model number, make)
+        if upper in name_tokens:
+            continue
+        # Skip very short values (1-2 chars are unlikely to be part numbers)
+        if len(p) <= 2:
+            continue
+        # Skip user-specified noise examples (exact match)
+        if upper in noise_exact:
+            continue
+        # Skip values matching noise prefixes (e.g., WO-, DWG-, IMG_, PO#)
+        if any(upper.startswith(prefix) for prefix in noise_prefixes):
+            continue
+        # Skip common non-part artifacts: file names, serial number labels
+        if re.search(r'\.(jpg|jpeg|png|pdf|doc|docx|xls|xlsx)$', p, re.I):
+            continue
+        # Skip date fragments: dd/yyyy, mm/yyyy, yyyy-mm
+        if re.match(r'^\d{1,2}/\d{4}$', p) or re.match(r'^\d{4}-\d{2}$', p):
+            continue
+        # Skip values that are a substring of a noise example (e.g., "2024-0451" from "WO-2024-0451")
+        if noise_exact:
+            is_noise_fragment = False
+            for noise_val in noise_exact:
+                if upper in noise_val or noise_val.endswith(upper):
+                    is_noise_fragment = True
+                    break
+            if is_noise_fragment:
+                continue
+        filtered.append(p)
+
+    return filtered
 
 
 def pick_column(headers, description, default_guesses):
@@ -151,6 +305,9 @@ Examples:
   python extract_parts.py input.csv -o parts_output.csv
   python extract_parts.py input.csv -o parts_output.csv \\
       --name-col "Equipment Name" --code-col "Code" --parts-col "Description"
+  python extract_parts.py input.csv -o parts_output.csv \\
+      --sample-parts "KMP-8347, 259-0815, 6754-81-8180, T165404, VOE11709634" \\
+      --sample-noise "WO-2024-0451, DWG-4410, IMG_4521.jpg, PO# 20240087, SN: CAT00D6T"
 
 Environment variables:
   OPENROUTER_API_KEY   API key for OpenRouter (alternative to --api-key)
@@ -191,6 +348,20 @@ Environment variables:
         default=1.0,
         help="Delay in seconds between API calls (default: 1.0)",
     )
+    parser.add_argument(
+        "--sample-parts",
+        default="",
+        help="Comma-separated examples of real part numbers from your data, "
+             "so the extractor knows what to look for "
+             '(e.g., "KMP-8347, 6754-81-8180, T165404, VOE11709634")',
+    )
+    parser.add_argument(
+        "--sample-noise",
+        default="",
+        help="Comma-separated examples of things that look like part numbers "
+             "but should be IGNORED (work orders, serial numbers, drawing refs, "
+             'file names, etc.) e.g., "WO-2024-0451, DWG-4410, IMG_4521.jpg"',
+    )
 
     args = parser.parse_args()
 
@@ -222,12 +393,20 @@ Environment variables:
     print(f"  Equipment code: '{code_col}'")
     print(f"  Parts text:     '{parts_col}'")
 
+    sample_parts = args.sample_parts.strip()
+    sample_noise = args.sample_noise.strip()
+
     use_llm = bool(args.api_key)
     if use_llm:
         print(f"  Using OpenRouter model: {args.model}")
     else:
         print("  No API key — using regex fallback for part extraction.")
         print("  For better results, set OPENROUTER_API_KEY or use --api-key.")
+
+    if sample_parts:
+        print(f"  Sample part numbers: {sample_parts}")
+    if sample_noise:
+        print(f"  Sample noise to ignore: {sample_noise}")
 
     # Process each row
     all_results = []
@@ -246,10 +425,15 @@ Environment variables:
             continue
 
         if use_llm:
-            parts = extract_parts_with_llm(text_blob, args.api_key, args.model)
+            raw_parts = extract_parts_with_llm(
+                text_blob, args.api_key, args.model, sample_parts, sample_noise
+            )
         else:
-            parts = extract_parts_with_regex(text_blob)
+            raw_parts = extract_parts_with_regex(text_blob, sample_noise)
 
+        parts = filter_extracted_parts(raw_parts, equip_name, equip_code, sample_noise)
+        if len(raw_parts) != len(parts):
+            print(f"  (filtered {len(raw_parts) - len(parts)} false positive(s))")
         print(f"  => Found {len(parts)} part(s): {parts[:5]}{'...' if len(parts) > 5 else ''}")
         max_parts = max(max_parts, len(parts))
         all_results.append({"name": equip_name, "code": equip_code, "parts": parts})
